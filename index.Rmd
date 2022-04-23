@@ -1,0 +1,177 @@
+---
+title: "Housing prices and expectations of US economy"
+author: "Carlos Bello"
+date: "`r format(Sys.Date(), '%B %d, %Y')` "
+output:
+  html_document:
+    df_print: paged
+    code_folding: "hide"
+    toc: yes
+    fig_caption: yes
+    theme: cosmo
+    toc_float: no
+---
+
+[Visit my personal website](CarlosBello16.github.io)
+
+
+```{r setup, include=FALSE}
+rm(list = ls())
+graphics.off()
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loadPackages, message=FALSE, warning=FALSE}
+require(fpp3)
+require(tidyverse)
+require(dplyr)
+require(tidyquant)
+require(stargazer)
+require(kableExtra)
+require(vars)
+require(urca)
+require(tsDyn)
+require(apt) 
+require(timetk)
+require(forecast)
+```
+
+# Introduction
+
+In this paper, we will examine the possible relationship between housing prices in the United States and measurements of the consumer's expectation of the US economy. Economic intuition could lead us in multiple directions on the nature of this relationship. One one hand, indicators of house prices might have an effect on consumer's expectations on the economy, more so after the 2008 financial crisis. On the other hand, consumer expectations on the economy might be affecting their behaviors of buying and selling properties and therefore affecting the prices. 
+
+For this analysis we are utilizing two datasets from FRED. One is the S&P/Case-Shiller U.S. National Home Price Index (CSUSHPISA),  which is a seasonally adjusted index that shows us the housing prices in the US having 2010 as the relative baseline. The other is the University of Michigan: Consumer Sentiment (UMCSENT). It is an index that aggregate consumer's expectations on the growth of the economy in the next year. This analysis will be using these values from January 1st, 1988 to January 1st, 2022. 
+
+We have two options of models to analyze this relationship. Either a Vector Autoregression (VAR) or a Vector Error Correction Model (VECM.) We will explain the model we end up choosing to understand what is happening.
+``` {r ReadData, message= FALSE}
+varlist <- c("CSUSHPISA", "UMCSENT")
+RawData <- tq_get(varlist, get="economic.data", from= "1988-01-01", to= "2022-01-01")
+
+Data <- RawData %>%
+  mutate(month= yearmonth(date), value = price) %>%
+  dplyr::select(-c(date, price)) %>% 
+  as_tsibble(index=month, key= symbol)
+
+wData <- Data %>%
+  pivot_wider(names_from = symbol, values_from = value) %>%
+  drop_na()
+```
+
+
+``` {r CheckSeasonality, include=FALSE}
+DataS <-
+  model(wData, x11 = X_13ARIMA_SEATS(vars(UMCSENT) ~ x11())) %>%
+  components()
+autoplot(DataS) + xlab("Year") +
+  ggtitle("X11 decomposition of UMCSENT")
+```
+
+``` {r JoinSeasonAdjust, include= FALSE}
+wDatas <- left_join(wData, DataS) %>%
+  dplyr::select(-c(UMCSENT, .model, trend, seasonal, irregular))
+
+wData <- wDatas %>%
+  rename(saUMCSENT = season_adjust)
+```
+# Data and Testing Unit Roots
+
+We need to examine the nature of our data to know what kind of model we can utilize to answer our question. We need to see whether our variables have unit roots. Unit roots are a measure of systematic change that is unpredictable on the data. If not accounted for it can cause the calculations in our models to find relationship where there are none, or just ruin statistical calculations. Here we will see that our data does contain unit roots. More specifically, the house price index contains 2, while the consumer expectations contains 1. 
+
+Our choice of models will depend partly on the presence of these unit roots. Now we will try to reduce the unit roots of the house price index to get both variables to have one unit root. This will complete one condition to run the VEC model. To take away unit roots, we can either difference the data (calculate and use rates of change) or we can also use logs to attempt to normalize the data as much as possible. We will put a natural log to see if we are able to take away a unit root.
+
+```{r UnitRootTest, message=FALSE, warning=FALSE}
+Data %>% 
+  features(value, unitroot_ndiffs) %>% 
+  kable(format = "html", table.attr = "style='width:30%;' ") %>% 
+  kableExtra::kable_styling()
+```
+
+
+``` {r CleanData, message=FALSE, warning=FALSE}
+wData_alt <- wData %>%
+  mutate(logHouse = 100*log(CSUSHPISA))
+
+wData_alt %>%
+  features_at(vars(c(logHouse, saUMCSENT)), unitroot_ndiffs) %>% 
+  kable(format = "html", table.attr = "style='width:30%;' ") %>% 
+  kableExtra::kable_styling()
+
+ Data_alt <- wData_alt %>% dplyr::select(-c(CSUSHPISA)) %>%
+  pivot_longer(cols = c(logHouse, saUMCSENT), names_to = "symbol")
+ 
+  ggplot(Data_alt, aes(x = month, y = value)) +
+  geom_line() +
+  facet_grid(vars(symbol), scales = "free_y") 
+
+```
+
+Here we also have a plot of our two data sets. The values on both variables are indexes, therefore ther show a relative change throughout time, the units themselves are somewhat arbitrary. We also changed house price index to log and changed the magnitude to be able to capture an effect once we fit it to the model. 
+
+We were able to reduce the unit roots of the house price index to one. Now to check if we can actually run the VEC model we will need to run what is called a cointegration test (more specifically a Engle-Granger test). This will test whether the two variables are correlated with each other on the long-run. For the test to succeed in showing correlation in the long term, the error (the residual) from a linear static model between the two variables has to be stationary (have no unit roots.)
+
+``` {r CointegrationTest, message= FALSE}
+fitResid <- wData_alt %>%
+  model(TSLM(saUMCSENT ~ logHouse))
+augment(fitResid) %>% features(.resid, unitroot_kpss) %>%
+  kable(format = "html", table.attr = "style='width:30%;' ") %>%
+  kableExtra::kable_styling()
+augment(fitResid) %>% features(.resid, unitroot_ndiffs) %>%
+  kable(format = "html", table.attr = "style='width:30%;' ") %>%
+  kableExtra::kable_styling()
+```
+
+The two outputs shown here tell us the same thing. We fail to reject the presence of unit roots in the residuals of the linear model at 95% confidence interval. This is definitely an edge case as it is very near the cut off point of 95% confidence. We will say this condition is satisfied however and now we can use a VEC model to see the relationship between these two variables.
+
+``` {r SecondCointegrationTest, include= FALSE}
+house <- RawData %>% filter(symbol == "CSUSHPISA") %>% tk_xts()
+ConExp <- RawData %>% filter(symbol == "UMCSENT") %>% tk_xts()
+lhouse <- 100*log(house$price)
+
+coint_pairs <- lm(ConExp ~ lhouse)
+coint_pairs_resids <- coint_pairs$residuals
+summary(ur.df(coint_pairs_resids, type = "drift", selectlags = "BIC"))
+```
+
+# VEC Model
+
+The Vector Error-Correction model tries to examine the behaviors between two or more variables in the short and long run. It attempts to find a long term equilibrium that both variables share and accounts it while allowing to see how shocks in each variables seem to affect the behavior of the other. Two cointegrated variables could have dual causality, where a shock in either variable affects the other, or they could have a one way relationship, where the shock of only one of these variables will have an effect on the other. The model calculates how much the variables seem to "correct" their course if the other one has a change that deviates it from its long run equilibrium. 
+
+``` {r estVECMpairs, message=FALSE, warning=FALSE}
+pairs.data <- cbind(lhouse,ConExp)
+colnames(pairs.data) <- c("lhouse","ConExp")
+p.pairs.vecm <- VARselect(pairs.data,lag.max=20 ,type="const")$selection[2] 
+pairs.vecm <- VECM(pairs.data,p.pairs.vecm,r=1,include="const",estim="ML",LRinclude="none")
+summary(pairs.vecm)
+```
+
+After running our model, it seems like there is a one way relationship occurring. The expectations of consumers on the economy corrects to changes in the house price. The model is:
+
+$$ ECT_{t-1} = log(house_{t-1}) + 5.995ConExp_{t-1}$$
+
+If we look at the ECT values, we see that consumer expectations is the only one with statistically significant results. This means that consumer expectation on the economy in the future seem to increase when the price of houses go up. The following graph of the impulse response function will show how a positive shock in housing prices drives up consumer expectations above a 95% interval. The next graph shows that this relationship is not two-way, as a shock in consumer expectations does not drive the house prices away from its behaviour in equilibrium.  
+``` {r ShockGraph, message=FALSE}
+irf_pairs <- irf(pairs.vecm, n.ahead = 25)
+plot(irf_pairs)
+```
+
+Next, We will analyze the Forecast Error Variance Decomposition (FEVD). The first two columns will show how a shock to lhouse affects the joined variance of the two variables. The last two columns show the shock in consumer expectations. The findings seem to be not as palpable as the findings from the impulse response function above. One possible reason is due to the nature of the house princes and how they seem to be increasing greatly over time. It is possible that the model was not able to account for the whole long run equilibrium of the house prices (as they seem to be increasing over time beyond what the model was able to control for). Due to this, the FEVD is just capturing the constant increase of the house price variable, decreasing the proportion of the variation on consumer expectation.
+
+``` {r FEVD1, message=FALSE}
+fevd_pairs <- fevd(pairs.vecm, n.ahead = 25)
+cbind(head(fevd_pairs$lhouse,5),head(fevd_pairs$ConExp,5))
+```
+
+``` {r FEVD2, message=FALSE}
+cbind(tail(fevd_pairs$lhouse,5),tail(fevd_pairs$ConExp,5))  
+```
+
+
+``` {r FEVDGraph, message=FALSE}
+plot(fevd_pairs)
+```
+
+The graphs above is a visual representation the Forecast Error Variance Decomposition (FEVD). as we can see a shock on lhouse doesn't show the effect in consumer expectation because lhouse just keeps increasing and clouding the effect. While the shock in consumer expectation shows an increase in the variance decomposition for lhouse because lhouse is just naturally increasing over time. 
+
+# Conclusion
+
+The relationship between house prices and consumer expectations of the economy seems to be a one way, where positively affect consumer expectations. The relationship does not seem as too strong and there are definitely things that the model could not control for that could be skewing our results. 
